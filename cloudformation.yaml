@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Shopper Analytics Pipeline Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  
+Resources:
+  # S3 Bucket for raw data storage
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'shopper-analytics-raw-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+
+  # S3 Bucket for processed data
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'shopper-analytics-processed-${Environment}-${AWS::AccountId}'
+      
+  # Kinesis Data Stream
+  ShopperEventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub 'shopper-events-stream-${Environment}'
+      ShardCount: 2
+      RetentionPeriodHours: 24
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListStreams
+                Resource: !GetAtt ShopperEventsStream.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: 
+                  - !Sub '${RawDataBucket}/*'
+
+  # Lambda function for processing Kinesis events
+  KinesisProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'kinesis-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              bucket_name = 'shopper-analytics-raw-dev-' + context.invoked_function_arn.split(':')[4]
+              
+              for record in event['Records']:
+                  # Decode Kinesis data
+                  payload = base64.b64decode(record['kinesis']['data'])
+                  data = json.loads(payload)
+                  
+                  # Create S3 key with partitioning
+                  timestamp = datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00'))
+                  s3_key = f"year={timestamp.year}/month={timestamp.month:02d}/day={timestamp.day:02d}/hour={timestamp.hour:02d}/{record['kinesis']['sequenceNumber']}.json"
+                  
+                  # Store in S3
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=s3_key,
+                      Body=json.dumps(data),
+                      ContentType='application/json'
+                  )
+              
+              return {'statusCode': 200, 'body': 'Success'}
+
+  # Event Source Mapping for Lambda
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ShopperEventsStream.Arn
+      FunctionName: !Ref KinesisProcessorFunction
+      StartingPosition: LATEST
+      BatchSize: 100
+
+  # IAM Role for Glue
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+
+  # Glue Database
+  AnalyticsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub 'shopper_analytics_${Environment}'
+        Description: 'Database for shopper analytics data'
+
+  # Glue Crawler for raw data
+  RawDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub 'raw-data-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref AnalyticsDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${RawDataBucket}/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+Outputs:
+  RawDataBucketName:
+    Description: 'Name of the raw data S3 bucket'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+      
+  ProcessedDataBucketName:
+    Description: 'Name of the processed data S3 bucket'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+      
+  KinesisStreamName:
+    Description: 'Name of the Kinesis stream'
+    Value: !Ref ShopperEventsStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStream'
